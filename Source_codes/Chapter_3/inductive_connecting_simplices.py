@@ -1,3 +1,5 @@
+#By Tyler Foster and Abdullah Malik
+
 import dgl
 import torch
 import tqdm
