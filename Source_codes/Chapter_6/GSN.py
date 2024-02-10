@@ -1,4 +1,4 @@
-"""Modified Torch Module for Topology Adaptive Graph Convolutional layer"""
+"""Modified from Torch Module for Topology Adaptive Graph Convolutional layer"""
 # pylint: disable= no-member, arguments-differ, invalid-name
 import torch as th
 from torch import nn
