@@ -43,18 +43,14 @@ class GSN(nn.Module):
         out_feats,
         maximum_dim,
         bias=True,
-        activation=None,
-        weight=True,
+        activation=None
     ):
         super(GSN, self).__init__()
         self._in_feats = in_feats
         self._out_feats = out_feats
         self._maximum_dim = maximum_dim
         self._activation = activation
-        self.weight_bool = weight
-        if self.weight_bool:
-            self.lin = nn.Linear(in_feats * 2 * (self._maximum_dim + 1), out_feats, bias=bias)
-
+        self.lin = nn.Linear(in_feats * ((2*self._maximum_dim) + 1), out_feats, bias=bias)
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -93,33 +89,32 @@ class GSN(nn.Module):
             is size of output feature.
         """
         with graph.local_scope():
-            norm = th.pow(graph.in_degrees().to(feat).clamp(min=1), -0.5)
+            norm = th.pow(graph.in_degrees().float().clamp(min=1), -0.5)
             shp = norm.shape + (1,) * (feat.dim() - 1)
             norm = th.reshape(norm, shp).to(feat.device)
-            graph = dgl.reverse(graph, copy_edata=True, copy_ndata=True)
+
             msg_func = fn.copy_u("h", "m")
-
             fstack = [feat]
+            graph = dgl.reverse(graph)
             for _ in range(self._maximum_dim):
                 rst = fstack[-1] * norm
-                graph.ndata["h"] = rst
-                graph.update_all(msg_func, fn.sum(msg="m", out="h"))
-                rst = graph.ndata["h"]
+                graph.ndata['h'] = rst
+                graph.update_all(msg_func,fn.sum(msg='m', out='h'))
+                rst = graph.ndata['h']
                 rst = rst * norm
                 fstack.append(rst)
-            
-            graph = dgl.reverse(graph, copy_edata=True, copy_ndata=True)
                 
+            graph = dgl.reverse(graph)
+            
             for _ in range(self._maximum_dim):
                 rst = fstack[-1] * norm
-                graph.ndata["h"] = rst
-                graph.update_all(msg_func, fn.sum(msg="m", out="h"))
-                rst = graph.ndata["h"]
+                graph.ndata['h'] = rst
+                graph.update_all(msg_func,fn.sum(msg='m', out='h'))
+                rst = graph.ndata['h']
                 rst = rst * norm
                 fstack.append(rst)
 
-            if self.weight_bool:
-                rst = self.lin(th.cat(fstack, dim=-1))
+            rst = self.lin(th.cat(fstack, dim=-1))
 
             if self._activation is not None:
                 rst = self._activation(rst)
