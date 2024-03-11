@@ -1,117 +1,439 @@
-import dgl
-import torch
-import os
+"""
+This script trains and tests local version of the BnNN model for node classification on large graphs using GraphBolt dataloader.
 
-from torch.sparse import *
-os.environ['DGLBACKEND'] = 'pytorch'
-#from dgl.nn import GraphConv, SAGEConv
-from pathlib import Path
-import GSN
+Unlike previous dgl examples, we've utilized the newly defined dataloader
+from GraphBolt. 
+
+This flowchart describes the main functional sequence of the provided example:
+main
+│
+├───> OnDiskDataset pre-processing
+│
+├───> Instantiate BnNN model
+│
+├───> train
+│     │
+│     ├───> Get graphbolt dataloader
+│     │
+│     └───> Training loop
+│           │
+│           ├───> SAGE.forward
+│           │
+│           └───> Validation set evaluation
+│
+└───> All nodes set inference & Test set evaluation
+"""
+import argparse
+import time
+from GSN import CinchNETConv
+import dgl.graphbolt as gb
+import dgl.nn as dglnn
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from utils import plot_losses, train, train_step, get_experiment_stats
-from utils import test, characterize_performance, norm_plot
-from ogb.nodeproppred import DglNodePropPredDataset, Evaluator
-from scipy import stats
+import torchmetrics.functional as MF
+from tqdm import tqdm
 
 
-file_path_for_adj_graph_with_features = "./arxiv_adj_graph_with_features"
-arxiv_adj_graph, label_dict = dgl.load_graphs(file_path_for_adj_graph_with_features)
-arxiv_adj_graph = arxiv_adj_graph[0]   
+def create_dataloader(
+    graph, features, itemset, batch_size, fanout, device, num_workers, job
+):
+    """
+    Get a GraphBolt version of a dataloader for node classification tasks.
+    Parameters
+    ----------
+    job : one of ["train", "evaluate", "infer"]
+        The stage where dataloader is created, with options "train", "evaluate"
+        and "infer".
+    Other parameters are explicated in the comments below.
+    """
+
+    ############################################################################
+    # [Step-1]:
+    # gb.ItemSampler()
+    # [Input]:
+    # 'itemset': The current dataset. (e.g. `train_set` or `valid_set`)
+    # 'batch_size': Specify the number of samples to be processed together,
+    # referred to as a 'mini-batch'. (The term 'mini-batch' is used here to
+    # indicate a subset of the entire dataset that is processed together. This
+    # is in contrast to processing the entire dataset, known as a 'full batch'.)
+    # 'job': Determines whether data should be shuffled. (Shuffling is
+    # generally used only in training to improve model generalization. It's
+    # not used in validation and testing as the focus there is to evaluate
+    # performance rather than to learn from the data.)
+    # [Output]:
+    # An ItemSampler object for handling mini-batch sampling.
+    # [Role]:
+    # Initialize the ItemSampler to sample mini-batche from the dataset.
+    ############################################################################
+    datapipe = gb.ItemSampler(
+        itemset, batch_size=batch_size, shuffle=(job == "train")
+    )
+
+    ############################################################################
+    # [Step-2]:
+    # self.copy_to()
+    # [Input]:
+    # 'device': The device to copy the data to.
+    # 'extra_attrs': The extra attributes to copy.
+    # [Output]:
+    # A CopyTo object to copy the data to the specified device. Copying here
+    # ensures that the rest of the operations run on the GPU.
+    ############################################################################
+    if args.storage_device != "cpu":
+        datapipe = datapipe.copy_to(device=device, extra_attrs=["seed_nodes"])
+
+    ############################################################################
+    # [Step-3]:
+    # self.sample_neighbor()
+    # [Input]:
+    # 'graph': The network topology for sampling.
+    # '[-1] or fanout': Number of neighbors to sample per node. In
+    # training or validation, the length of `fanout` should be equal to the
+    # number of layers in the model. In inference, this parameter is set to
+    # [-1], indicating that all neighbors of a node are sampled.
+    # [Output]:
+    # A NeighborSampler object to sample neighbors.
+    # [Role]:
+    # Initialize a neighbor sampler for sampling the neighborhoods of nodes.
+    ############################################################################
+    datapipe = getattr(datapipe, args.sample_mode)(
+        graph, fanout if job != "infer" else [-1]
+    )
+
+    ############################################################################
+    # [Step-4]:
+    # self.fetch_feature()
+    # [Input]:
+    # 'features': The node features.
+    # 'node_feature_keys': The keys of the node features to be fetched.
+    # [Output]:
+    # A FeatureFetcher object to fetch node features.
+    # [Role]:
+    # Initialize a feature fetcher for fetching features of the sampled
+    # subgraphs.
+    ############################################################################
+    datapipe = datapipe.fetch_feature(features, node_feature_keys=["feat"])
+
+    ############################################################################
+    # [Step-5]:
+    # self.copy_to()
+    # [Input]:
+    # 'device': The device to copy the data to.
+    # [Output]:
+    # A CopyTo object to copy the data to the specified device.
+    ############################################################################
+    if args.storage_device == "cpu":
+        datapipe = datapipe.copy_to(device=device)
+
+    ############################################################################
+    # [Step-6]:
+    # gb.DataLoader()
+    # [Input]:
+    # 'datapipe': The datapipe object to be used for data loading.
+    # 'num_workers': The number of processes to be used for data loading.
+    # [Output]:
+    # A DataLoader object to handle data loading.
+    # [Role]:
+    # Initialize a multi-process dataloader to load the data in parallel.
+    ############################################################################
+    dataloader = gb.DataLoader(
+        datapipe,
+        num_workers=num_workers,
+        overlap_graph_fetch=args.overlap_graph_fetch,
+    )
+
+    # Return the fully-initialized DataLoader object.
+    return dataloader
 
 
-class BnNN(nn.Module):
-    def __init__(self, graph, input_layer:int, hidden_layers:int, output_layer:int, num_layers:int, dropout):
-        self.input_layer   = input_layer
-        self.hidden_layers = hidden_layers
-        self.output_layer  = output_layer
-        self.num_layers    = num_layers
-        self.dropout       = dropout
-        self.graph         = graph
-        super(BnNN, self).__init__()
-        self.convs         = nn.ModuleList()
-        self.bns           = torch.nn.ModuleList()
-        self.bns.append(torch.nn.BatchNorm1d(hidden_layers))
-        maximum_dim = 2
-        self.convs.append(GSN.GSN(input_layer, hidden_layers, maximum_dim, bias=True))
-        
-        for _ in range(num_layers - 2):
-            self.convs.append(GSN.GSN(hidden_layers, hidden_layers, maximum_dim, bias=True))
-            self.bns.append(torch.nn.BatchNorm1d(hidden_layers))
-        self.convs.append(GSN.GSN(hidden_layers, output_layer, maximum_dim, bias=True))
+class CinchNET(nn.Module):
+    def __init__(self, in_size, hidden_size, out_size, max_dim):
+        super().__init__()
+        self.layers = nn.ModuleList()
+        # Three-layer CinchNET.
+        self.layers.append(CinchNETConv(in_size, hidden_size, max_dim=max_dim))
+        self.layers.append(CinchNETConv(hidden_size, hidden_size, max_dim=max_dim))
+        self.layers.append(CinchNETConv(hidden_size, out_size, max_dim=max_dim))
+        self.dropout = nn.Dropout(0.5)
+        self.hidden_size = hidden_size
+        self.out_size = out_size
+        # Set the dtype for the layers manually.
+        self.set_layer_dtype(torch.float32)
 
-    def forward(self, graph, input_features):
-        for conv in self.convs[:-1]:
-            input_features = conv(graph, input_features)
-            input_features = F.relu(input_features)
-            input_features = F.dropout(input_features, p=self.dropout, training=self.training)
-        input_features = self.convs[-1](graph, input_features)
-        return input_features.log_softmax(dim=-1)
-    
-    def reset_parameters(self):
-        for conv in self.convs:
-            conv.reset_parameters()
-        for bn in self.bns:
-            bn.reset_parameters()
-            
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-device = torch.device(device)
-dataset = DglNodePropPredDataset(name = "ogbn-arxiv", root = 'dataset/')
-split_idx = dataset.get_idx_split()
-labels = dataset.labels.flatten().to(device)
-val_acc_lb, val_acc_lb_var, test_acc_lb, test_acc_lb_var = 0.7300, 0.0017, 0.7174, 0.0029
-evaluator = Evaluator(name = "ogbn-arxiv")
+    def set_layer_dtype(self, _dtype):
+        for layer in self.layers:
+            for param in layer.parameters():
+                param.data = param.data.to(_dtype)
 
-def getdim_inlayer(graph):
-    """The dimensions of each node features is different, so 
-    a function here is needed that can yield the dimension of the input layer"""
-    return graph.ndata['feat'].size()[1]
+    def forward(self, blocks, x):
+        hidden_x = x
+        for layer_idx, (layer, block) in enumerate(zip(self.layers, blocks)):
+            hidden_x = layer(block, hidden_x)
+            is_last_layer = layer_idx == len(self.layers) - 1
+            if not is_last_layer:
+                hidden_x = F.relu(hidden_x)
+                hidden_x = self.dropout(hidden_x)
+        return hidden_x
 
-model_kwargs = dict(graph=arxiv_adj_graph, input_layer=getdim_inlayer(arxiv_adj_graph), 
-                     hidden_layers=512, output_layer=40, 
-                 num_layers=3, dropout=0.5)
-model = BnNN(**model_kwargs).to(device)
+    def inference(self, graph, features, dataloader, storage_device):
+        """Conduct layer-wise inference to get all the node embeddings."""
+        pin_memory = storage_device == "pinned"
+        buffer_device = torch.device("cpu" if pin_memory else storage_device)
 
-# Where to save the best model
-model_path = 'models'
-Path(model_path).mkdir(parents=True, exist_ok=True)
-gcn_path = f"{model_path}/gcn_typeI_bidirected_a1_b0.model"
+        for layer_idx, layer in enumerate(self.layers):
+            is_last_layer = layer_idx == len(self.layers) - 1
 
-"""Replace name of graph"""
-train_args = dict(
-    graph=arxiv_adj_graph, labels=labels, split_idx=split_idx, 
-    epochs=200, evaluator=evaluator, device=device, 
-    save_path=gcn_path, lr=5e-3, es_criteria=50,
-)
+            y = torch.empty(
+                graph.total_num_nodes,
+                self.out_size if is_last_layer else self.hidden_size,
+                dtype=torch.float32,
+                device=buffer_device,
+                pin_memory=pin_memory,
+            )
+            for data in tqdm(dataloader):
+                # len(blocks) = 1
+                hidden_x = layer(data.blocks[0], data.node_features["feat"])
+                if not is_last_layer:
+                    hidden_x = F.relu(hidden_x)
+                    hidden_x = self.dropout(hidden_x)
+                # By design, our output nodes are contiguous.
+                y[data.seed_nodes[0] : data.seed_nodes[-1] + 1] = hidden_x.to(
+                    buffer_device
+                )
+            if not is_last_layer:
+                features.update("node", None, "feat", y)
 
-"""Replace name of graph and features to add"""
-print("Training for arxiv_graph_bidirected_type0 with I + A +A^T norm = left using beta = 0 and alpha = 1")
-train_losses, val_losses = train(model=model, verbose=True, **train_args)
-plot_losses(train_losses, val_losses, log=True, modelname='typeI_I+A+AT_a1_b0')
+        return y
 
-"""Replace name of graph"""
-_ = characterize_performance(model, arxiv_adj_graph, labels, split_idx, evaluator, gcn_path, verbose=True)
 
-print("Beginning training with 10 experiments of the model for directed graph with mixed tv..")
-df_gcn = get_experiment_stats(
-    model_cls=BnNN, model_args=model_kwargs,
-    train_args=train_args, n_experiments=10
-)
+@torch.no_grad()
+def layerwise_infer(
+    args, graph, features, test_set, all_nodes_set, model, num_classes
+):
+    model.eval()
+    dataloader = create_dataloader(
+        graph=graph,
+        features=features,
+        itemset=all_nodes_set,
+        batch_size=4 * args.batch_size,
+        fanout=[-1],
+        device=args.device,
+        num_workers=args.num_workers,
+        job="infer",
+    )
+    pred = model.inference(graph, features, dataloader, args.storage_device)
+    pred = pred[test_set._items[0]]
+    label = test_set._items[1].to(pred.device)
 
-print("Creating norm plot for directed graph with tv and pi")
-norm_plot(
-    [
-        (test_acc_lb, test_acc_lb_var, 'Leaderboard'), 
-        (df_gcn.loc['mean', 'test_acc'], df_gcn.loc['std', 'test_acc'], 'GCN'),
-    ],
-    'Test Performance'
-)
+    return MF.accuracy(
+        pred,
+        label,
+        task="multiclass",
+        num_classes=num_classes,
+    )
 
-print("Evaluating the model for directed graph with refined tv")
-_, p = stats.ttest_ind_from_stats(
-    test_acc_lb, test_acc_lb_var, 10,
-    df_gcn.loc['mean', 'test_acc'], df_gcn.loc['std', 'test_acc'], 10,
-    equal_var=False,
-)
-print(f"Mean Test Accuracy Improvement: {(df_gcn.loc['mean', 'test_acc'] - test_acc_lb):.4f}")
-print(f"Probability that these are from the same performance distribution = {p*100:.0f}%")
+
+@torch.no_grad()
+def evaluate(args, model, graph, features, itemset, num_classes):
+    model.eval()
+    y = []
+    y_hats = []
+    dataloader = create_dataloader(
+        graph=graph,
+        features=features,
+        itemset=itemset,
+        batch_size=args.batch_size,
+        fanout=args.fanout,
+        device=args.device,
+        num_workers=args.num_workers,
+        job="evaluate",
+    )
+
+    for step, data in tqdm(enumerate(dataloader), "Evaluating"):
+        x = data.node_features["feat"]
+        y.append(data.labels)
+        y_hats.append(model(data.blocks, x))
+
+    return MF.accuracy(
+        torch.cat(y_hats),
+        torch.cat(y),
+        task="multiclass",
+        num_classes=num_classes,
+    )
+
+
+def train(args, graph, features, train_set, valid_set, num_classes, model):
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=args.lr, weight_decay=5e-4
+    )
+    dataloader = create_dataloader(
+        graph=graph,
+        features=features,
+        itemset=train_set,
+        batch_size=args.batch_size,
+        fanout=args.fanout,
+        device=args.device,
+        num_workers=args.num_workers,
+        job="train",
+    )
+
+    for epoch in range(args.epochs):
+        t0 = time.time()
+        model.train()
+        total_loss = 0
+        for step, data in tqdm(enumerate(dataloader), "Training"):
+            # The input features from the source nodes in the first layer's
+            # computation graph.
+            x = data.node_features["feat"]
+
+            # The ground truth labels from the destination nodes
+            # in the last layer's computation graph.
+            y = data.labels
+
+            y_hat = model(data.blocks, x)
+
+            # Compute loss.
+            loss = F.cross_entropy(y_hat, y)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        t1 = time.time()
+        # Evaluate the model.
+        acc = evaluate(args, model, graph, features, valid_set, num_classes)
+        print(
+            f"Epoch {epoch:05d} | Loss {total_loss / (step + 1):.4f} | "
+            f"Accuracy {acc.item():.4f} | Time {t1 - t0:.4f}"
+        )
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="A script trains and tests a GraphSAGE model "
+        "for node classification using GraphBolt dataloader."
+    )
+    parser.add_argument(
+        "--epochs", type=int, default=10, help="Number of training epochs."
+    )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=1e-3,
+        help="Learning rate for optimization.",
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=1024, help="Batch size for training."
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=0,
+        help="Number of workers for data loading.",
+    )
+    parser.add_argument(
+        "--fanout",
+        type=str,
+        default="2,2,2",
+        help="Fan-out of neighbor sampling. It is IMPORTANT to keep len(fanout)"
+        " identical with the number of layers in your model. Default: 2,2,2",
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="ogbn-products",
+        choices=["ogbn-arxiv", "ogbn-products", "ogbn-papers100M"],
+        help="The dataset we can use for node classification example. Currently"
+        " ogbn-products, ogbn-arxiv, ogbn-papers100M datasets are supported.",
+    )
+    parser.add_argument(
+        "--mode",
+        default="pinned-cuda",
+        choices=["cpu-cpu", "cpu-cuda", "pinned-cuda", "cuda-cuda"],
+        help="Dataset storage placement and Train device: 'cpu' for CPU and RAM,"
+        " 'pinned' for pinned memory in RAM, 'cuda' for GPU and GPU memory.",
+    )
+    parser.add_argument(
+        "--sample-mode",
+        default="sample_neighbor",
+        choices=["sample_neighbor", "sample_layer_neighbor"],
+        help="The sampling function when doing layerwise sampling.",
+    )
+    parser.add_argument(
+        "--overlap-graph-fetch",
+        action="store_true",
+        help="An option for enabling overlap_graph_fetch in graphbolt dataloader."
+        "If True, the data loader will overlap the UVA graph fetching operations"
+        "with the rest of operations by using an alternative CUDA stream. Disabled"
+        "by default.",
+    )
+    parser.add_argument(
+        "--dim",
+        action="store",
+        type=int,
+        help="An option to specify the highest dimension for which the number of simplices should be searched for. Default is 5",
+        default = 5,
+    )
+    return parser.parse_args()
+
+
+def main(args):
+    if not torch.cuda.is_available():
+        args.mode = "cpu-cpu"
+    print(f"Training in {args.mode} mode.")
+    args.storage_device, args.device = args.mode.split("-")
+    args.device = torch.device(args.device)
+
+    # Load and preprocess dataset.
+    print("Loading data...")
+    dataset = gb.BuiltinDataset("ogbn-arxiv").load()
+
+    # Move the dataset to the selected storage.
+    if args.storage_device == "pinned":
+        graph = dataset.graph.pin_memory_()
+        features = dataset.feature.pin_memory_()
+    else:
+        graph = dataset.graph.to(args.storage_device)
+        features = dataset.feature.to(args.storage_device)
+
+    train_set = dataset.tasks[0].train_set
+    valid_set = dataset.tasks[0].validation_set
+    test_set = dataset.tasks[0].test_set
+    all_nodes_set = dataset.all_nodes_set
+    args.fanout = list(map(int, args.fanout.split(",")))
+    max_dim = args.dim
+
+    num_classes = dataset.tasks[0].metadata["num_classes"]
+
+    in_size = features.size("node", None, "feat")[0]
+    hidden_size = 256
+    out_size = num_classes
+
+    model = CinchNET(in_size, hidden_size, out_size, max_dim)
+    assert len(args.fanout) == len(model.layers)
+    model = model.to(args.device)
+
+    # Model training.
+    print("Training...")
+    train(args, graph, features, train_set, valid_set, num_classes, model)
+
+    # Test the model.
+    print("Testing...")
+    test_acc = layerwise_infer(
+        args,
+        graph,
+        features,
+        test_set,
+        all_nodes_set,
+        model,
+        num_classes,
+    )
+    print(f"Test accuracy {test_acc.item():.4f}")
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    main(args)
