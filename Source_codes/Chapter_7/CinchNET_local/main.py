@@ -1,10 +1,8 @@
 """
+modified from https://github.com/dmlc/dgl/blob/master/examples/sampling/graphbolt/node_classification.py
 This script trains and tests local version of the BnNN model for node classification on large graphs using GraphBolt dataloader.
 
-Unlike previous dgl examples, we've utilized the newly defined dataloader
-from GraphBolt. 
-
-This flowchart describes the main functional sequence of the provided example:
+This flowchart describes the main functional sequence:
 main
 │
 ├───> OnDiskDataset pre-processing
