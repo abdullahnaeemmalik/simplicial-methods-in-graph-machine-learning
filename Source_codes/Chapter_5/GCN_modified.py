@@ -1,5 +1,4 @@
-"""Torch modules for graph convolutions(GCN) modified to account
-for parameter alpha and beta."""
+"""Torch modules for graph convolutions(GCN) modified to account for parameters alpha and beta."""
 import torch as th
 from torch import nn
 from torch.nn import init
@@ -99,10 +98,9 @@ class GraphConv(nn.Module):
             feat_src, feat_dst = expand_as_pair(feat, graph)
             degs_out = graph.out_degrees().to(feat_src).clamp(min=1)
             degs_in = graph.in_degrees().to(feat_dst).clamp(min=1)
-            degs_in = th.pow(degs_in, self._alpha)
-            degs_out = th.pow(degs_out, self._beta)
+            degs_in = th.pow(degs_in, -self._alpha)
+            degs_out = th.pow(degs_out, -self._beta)
             degs = degs_in * degs_out
-            norm = 1.0 / degs
             shp = norm.shape + (1,) * (feat_src.dim() - 1)
             norm = th.reshape(norm, shp)
             feat_src = feat_src * norm
