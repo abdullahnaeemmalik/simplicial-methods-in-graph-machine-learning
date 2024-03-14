@@ -78,11 +78,11 @@ class CinchNETConv(nn.Module):
         """
         Description
         -----------
-        Creates adjancency graph of a given graph sublock
+        Creates adjancency graph of a given a subgraph block
         
         Parameters
         ----------
-        graph : DGLGraph
+        graph : DGLGraph (is_block == True)
             The for which its adjancecy graph needs to be computed.
         
         Output
@@ -91,8 +91,10 @@ class CinchNETConv(nn.Module):
         
         """
         heavy_duty=SimplicialFinder(graph)
+        
         for index in range(self._maximum_dim-1):
             heavy_duty.connectivity_update()
+            
         simplex_dict = heavy_duty.zero_skeleton_dict
         adj_graph = AdjFunctor(simplex_dict,deg_simplices=False)
         adj_graph.fill_edges()
@@ -102,7 +104,32 @@ class CinchNETConv(nn.Module):
         dst = dst.tolist()
         set_of_nodes = set(src+dst)
         seed_nodes = list(set_of_nodes)
+        node_simplex_dict = adj_graph.adj_graph_node_dict
+        
+        #add features to adj_graph
+        
+        concatenated_features = []
+        
+        for simplex_node_id in adj_graph.nodes():
+            simplex_node = node_simplex_dict[int(simplex_node_id)]
+            length = len(simplex_node)
+            concatenated_feature = th.zeros(0)
+            
+            for node in simplex_node:
+                concatenated_feature = th.cat((concatenated_feature,graph.ndata['feat'][node],), dim=0)
+                
+            remainder = self._maximum_dim - length + 1
+            
+            for _ in range(remainder):
+                concatenated_feature = th.cat((concatenated_feature,th.zeros(self._in_feats)), dim=0)
+                
+            concatenated_features.append(concatenated_feature)
+            
+        concatenated_features_non_deg = th.stack(concatenated_features, dim=0)
+        adj_graph.ndata['feat'] = concatenated_features_non_deg
+        
         return adj_graph, seed_nodes
+        
 
 
     def forward(self, graph, feat):
