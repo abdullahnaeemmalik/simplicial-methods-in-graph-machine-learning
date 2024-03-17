@@ -1,13 +1,12 @@
 """
-modified from https://github.com/dmlc/dgl/blob/master/examples/sampling/graphbolt/node_classification.py
-This script trains and tests local version of the BnNN model for node classification on large graphs using GraphBolt dataloader.
+This script trains and tests local version of the BnNN model for node classification on large graphs using GraphBolt dataloader. Modified from https://github.com/dmlc/dgl/blob/master/examples/sampling/graphbolt/node_classification.py
 
 This flowchart describes the main functional sequence:
 main
 │
 ├───> OnDiskDataset pre-processing
 │
-├───> Instantiate BnNN model
+├───> Instantiate CinchNET model
 │
 ├───> train
 │     │
@@ -15,7 +14,7 @@ main
 │     │
 │     └───> Training loop
 │           │
-│           ├───> SAGE.forward
+│           ├───> CinchNET-forward
 │           │
 │           └───> Validation set evaluation
 │
@@ -62,7 +61,7 @@ def create_dataloader(
     # [Output]:
     # An ItemSampler object for handling mini-batch sampling.
     # [Role]:
-    # Initialize the ItemSampler to sample mini-batche from the dataset.
+    # Initialize the ItemSampler to sample mini-batches from the dataset.
     ############################################################################
     datapipe = gb.ItemSampler(
         itemset, batch_size=batch_size, shuffle=(job == "train")
@@ -150,9 +149,9 @@ class CinchNET(nn.Module):
         super().__init__()
         self.layers = nn.ModuleList()
         # Three-layer CinchNET.
-        self.layers.append(CinchNETConv(in_size, hidden_size, max_dim=max_dim))
-        self.layers.append(CinchNETConv(hidden_size, hidden_size, max_dim=max_dim))
-        self.layers.append(CinchNETConv(hidden_size, out_size, max_dim=max_dim))
+        self.layers.append(CinchNETConv(in_size, hidden_size, maximum_dim=max_dim))
+        self.layers.append(CinchNETConv(hidden_size, hidden_size, maximum_dim=max_dim))
+        self.layers.append(CinchNETConv(hidden_size, out_size, maximum_dim=max_dim))
         self.dropout = nn.Dropout(0.5)
         self.hidden_size = hidden_size
         self.out_size = out_size
@@ -335,9 +334,9 @@ def parse_args():
     parser.add_argument(
         "--fanout",
         type=str,
-        default="2,2,2",
+        default="15,10,10",
         help="Fan-out of neighbor sampling. It is IMPORTANT to keep len(fanout)"
-        " identical with the number of layers in your model. Default: 2,2,2",
+        " identical with the number of layers in your model. Default: 15,10,10",
     )
     parser.add_argument(
         "--dataset",
@@ -387,6 +386,7 @@ def main(args):
 
     # Load and preprocess dataset.
     print("Loading data...")
+    #Note: This adds reversed edges to the graph by default.
     dataset = gb.BuiltinDataset("ogbn-arxiv").load()
 
     # Move the dataset to the selected storage.
