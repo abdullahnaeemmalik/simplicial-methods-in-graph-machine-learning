@@ -53,8 +53,8 @@ def train(graph, labels, model, epochs,
     features = graph.ndata['feat']
     #the masks are converted to torch.uint8 when loaded from file. Better to have them in bool.
     train_mask = graph.ndata['train_mask'].bool().to(device)
-    val_mask = graph.ndata['val_mask']..bool().to(device)
-    test_mask = graph.ndata['test_mask']..bool().to(device)
+    val_mask = graph.ndata['val_mask'].bool().to(device)
+    test_mask = graph.ndata['test_mask'].bool().to(device)
     es_iters = 0
 
     for e in range(1, epochs+1):
