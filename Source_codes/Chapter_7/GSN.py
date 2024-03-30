@@ -4,8 +4,6 @@ import torch as th
 from torch import nn
 import dgl
 from dgl import function as fn
-from ConnectingEnvelopes import SimplicialFinder
-from AdjFunctor import AdjFunctor
 
 class CinchNETConv(nn.Module):
     r"""
@@ -54,9 +52,10 @@ class CinchNETConv(nn.Module):
         self._maximum_dim = maximum_dim
         self._activation = activation
         self.weight_bool = weight
+        
+        #adds weights to each dimension. Multiply by 2 because we're going up once all the dimension and then down
         if self.weight_bool:
-            self.lin = nn.Linear(in_feats * 2 * (self._maximum_dim + 1), out_feats, bias=bias)
-        self.adj_graph = dgl.heterograph({('non-degenerate', 'd', 'non-degenerate'): ([], [])})
+            self.lin = nn.Linear(in_feats * ((2*self._maximum_dim) +1), out_feats, bias=bias)
 
         self.reset_parameters()
 
@@ -73,63 +72,6 @@ class CinchNETConv(nn.Module):
         """
         gain = nn.init.calculate_gain("relu")
         nn.init.xavier_normal_(self.lin.weight, gain=gain)
-        
-    def create_adj_graph(self,graph):
-        """
-        Description
-        -----------
-        Creates adjancency graph of a given a subgraph block
-        
-        Parameters
-        ----------
-        graph : DGLGraph (is_block == True)
-            The for which its adjancecy graph needs to be computed.
-        
-        Output
-        ------
-        Adjacency graph and a list of original nodes of the graph
-        
-        """
-        heavy_duty=SimplicialFinder(graph)
-        
-        for index in range(self._maximum_dim-1):
-            heavy_duty.connectivity_update()
-            
-        simplex_dict = heavy_duty.zero_skeleton_dict
-        adj_graph = AdjFunctor(simplex_dict,deg_simplices=False)
-        adj_graph.fill_edges()
-        self._maximum_dim = min(adj_graph.max_dim,self._maximum_dim)
-        src, dst = graph.edges()
-        src = src.tolist()
-        dst = dst.tolist()
-        set_of_nodes = set(src+dst)
-        seed_nodes = list(set_of_nodes)
-        node_simplex_dict = adj_graph.adj_graph_node_dict
-        
-        #add features to adj_graph
-        
-        concatenated_features = []
-        
-        for simplex_node_id in adj_graph.nodes():
-            simplex_node = node_simplex_dict[int(simplex_node_id)]
-            length = len(simplex_node)
-            concatenated_feature = th.zeros(0)
-            
-            for node in simplex_node:
-                concatenated_feature = th.cat((concatenated_feature,graph.ndata['feat'][node],), dim=0)
-                
-            remainder = self._maximum_dim - length + 1
-            
-            for _ in range(remainder):
-                concatenated_feature = th.cat((concatenated_feature,th.zeros(self._in_feats)), dim=0)
-                
-            concatenated_features.append(concatenated_feature)
-            
-        concatenated_features_non_deg = th.stack(concatenated_features, dim=0)
-        adj_graph.ndata['feat'] = concatenated_features_non_deg
-        
-        return adj_graph, seed_nodes
-        
 
 
     def forward(self, graph, feat):
@@ -137,7 +79,7 @@ class CinchNETConv(nn.Module):
 
         Description
         -----------
-        Compute CinchNET convolution, formerly known as Gated Simplicial Convolution
+        Compute CinchNET convolution, the nonlocal version
 
         Parameters
         ----------
@@ -153,40 +95,38 @@ class CinchNETConv(nn.Module):
             The output feature of shape :math:`(N, D_{out})` where :math:`D_{out}`
             is size of output feature.
         """
-        
-        adj_graph, seed_nodes = self.create_adj_graph(graph)
-        with adj_graph.local_scope():
-            adj_graph = dgl.add_self_loop(adj_graph)
-            norm = th.pow(adj_graph.in_degrees().to(feat).clamp(min=1), -0.5)
+        with graph.local_scope():
+            feat = graph.ndata['feat']
+            graph = dgl.add_self_loop(graph)
+            norm = th.pow(graph.in_degrees().to(feat).clamp(min=1), -0.5)
             shp = norm.shape + (1,) * (feat.dim() - 1)
             norm = th.reshape(norm, shp).to(feat.device)
-            adj_graph = dgl.reverse(adj_graph, copy_edata=True, copy_ndata=True)
+            graph = dgl.reverse(graph, copy_edata=True, copy_ndata=True)
             msg_func = fn.copy_u("h", "m")
-
+    
             fstack = [feat]
             for _ in range(self._maximum_dim):
                 rst = fstack[-1] * norm
-                adj_graph.ndata["h"] = rst
-                adj_graph.update_all(msg_func, fn.sum(msg="m", out="h"))
-                rst = adj_graph.ndata["h"]
+                graph.ndata["h"] = rst
+                graph.update_all(msg_func, fn.sum(msg="m", out="h"))
+                rst = graph.ndata["h"]
                 rst = rst * norm
                 fstack.append(rst)
             
-            adj_graph = dgl.reverse(adj_graph, copy_edata=True, copy_ndata=True)
-                
+            graph = dgl.reverse(graph, copy_edata=True, copy_ndata=True)
+                    
             for _ in range(self._maximum_dim):
                 rst = fstack[-1] * norm
-                adj_graph.ndata["h"] = rst
-                adj_graph.update_all(msg_func, fn.sum(msg="m", out="h"))
-                rst = adj_graph.ndata["h"]
+                graph.ndata["h"] = rst
+                graph.update_all(msg_func, fn.sum(msg="m", out="h"))
+                rst = graph.ndata["h"]
                 rst = rst * norm
                 fstack.append(rst)
-
+    
             if self.weight_bool:
                 rst = self.lin(th.cat(fstack, dim=-1))
-
+    
             if self._activation is not None:
                 rst = self._activation(rst)
-                
-            seednodes_tensor = th.tensor(seed_nodes)
-            return rst[seednodes_tensor]
+    
+            return rst

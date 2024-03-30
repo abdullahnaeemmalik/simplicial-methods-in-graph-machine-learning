@@ -13,7 +13,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import pickle
 
-val_acc_lb, val_acc_lb_var, test_acc_lb, test_acc_lb_var = 0.7300, 0.0017, 0.7174, 0.0029
+test_acc_lb, test_acc_lb_var = 82.5, 0.7
 
 def plot_losses(train_losses, val_losses, modelname, log=False):
     """
@@ -41,19 +41,20 @@ def plot_losses(train_losses, val_losses, modelname, log=False):
         pickle.dump(val_losses, file)
         
     
-def train(graph, labels, split_idx, model, epochs, evaluator, 
+def train(graph, labels, model, epochs, 
           device, save_path, loss_fn=F.cross_entropy, lr=0.01, es_criteria=5, verbose=False):
     optimizer = optim.Adam(model.parameters(), lr=lr)
     best_val_acc = 0
     best_test_acc = 0
     train_losses = list()
     val_losses = list()
-
-    features = graph.ndata['feat']
     
-    train_mask = split_idx['train'].to(device)
-    val_mask = split_idx['valid'].to(device)
-    test_mask = split_idx['test'].to(device)
+    labels = labels
+    features = graph.ndata['feat']
+    #the masks are converted to torch.uint8 when loaded from file. Better to have them in bool.
+    train_mask = graph.ndata['train_mask'].bool().to(device)
+    val_mask = graph.ndata['val_mask']..bool().to(device)
+    test_mask = graph.ndata['test_mask']..bool().to(device)
     es_iters = 0
 
     for e in range(1, epochs+1):
@@ -65,7 +66,7 @@ def train(graph, labels, split_idx, model, epochs, evaluator,
         val_losses.append(val_loss)
 
         # Compute accuracy on training/validation/test
-        train_acc, val_acc, test_acc = test(model, graph, labels, split_idx, evaluator)
+        train_acc, val_acc, test_acc = test(model, graph, labels, train_mask, val_mask, test_mask)
 
         # Save the best validation accuracy and the corresponding test accuracy.
         if best_val_acc < val_acc:
@@ -105,8 +106,7 @@ def train_step(model, graph, features, labels, train_mask, val_mask, optimizer, 
     return loss.item(), val_loss.item()
 
 @torch.no_grad()
-def test(model_cp, graph, labels, split_idx, evaluator, best_path=None):
-#def test(model, graph, labels, split_idx, evaluator, best_path=None):
+def test(model_cp, graph, labels, train_mask, val_mask, test_mask, best_path=None):
     model = deepcopy(model_cp)
     
     if best_path is not None:
@@ -117,43 +117,20 @@ def test(model_cp, graph, labels, split_idx, evaluator, best_path=None):
     features = graph.ndata['feat']
     logits = model(graph, features)
     y_pred = logits.argmax(1, keepdim=True)
+    #y_pred = logits.argmax(1)
 
-    train_acc = evaluator.eval({
-        'y_true': labels[split_idx['train']].reshape((-1,1)),
-        'y_pred': y_pred[split_idx['train']],
-    })['acc']
-    valid_acc = evaluator.eval({
-        'y_true': labels[split_idx['valid']].reshape((-1,1)),
-        'y_pred': y_pred[split_idx['valid']],
-    })['acc']
-    test_acc = evaluator.eval({
-        'y_true': labels[split_idx['test']].reshape((-1,1)),
-        'y_pred': y_pred[split_idx['test']],
-    })['acc']
+    train_acc = (y_pred[train_mask] == labels[train_mask]).float().mean()
+    val_acc = (y_pred[val_mask] == labels[val_mask]).float().mean()
+    test_acc = (y_pred[test_mask] == labels[test_mask]).float().mean()
 
-    return train_acc, valid_acc, test_acc
+    return train_acc, val_acc, test_acc
 
-def characterize_performance(model, graph, labels, split_idx, evaluator, best_path, verbose=False):
-    train_acc, val_acc, test_acc = test(model, graph, labels, split_idx, evaluator, best_path)
+def characterize_performance(model, graph, labels, train_mask, val_mask, test_mask, best_path, verbose=False):
+    train_acc, val_acc, test_acc = test(model, graph, labels, train_mask, val_mask, test_mask, best_path)
     print(
-        f"Leaderboard:  Test Acc={test_acc_lb} +/- {test_acc_lb_var}, Val Acc={val_acc_lb} +/- {val_acc_lb_var}\n"
+        f"Leaderboard:  Test Acc={test_acc_lb} +/- {test_acc_lb_var}\n"
         f"Yours:        Test Acc={test_acc:.4f},            Val Acc={val_acc:.4f}\n"
     )
-
-    val_lb = val_acc_lb - val_acc_lb_var
-    val_ub = val_acc_lb + val_acc_lb_var
-    
-    if verbose:
-        if not val_acc >= val_lb:
-            print(
-                f"Validation performance is worse than LB.  Expected lower bound of {val_lb:.4f}, but got {val_acc:.4f}.")
-        elif val_acc > val_ub:
-            print(
-                f"Validation performance is better than LB.  Expected upper bound of {val_ub:.4f}, but got {val_acc:.4f}.")
-        else: 
-            print(
-                f"Validation performance is in the expected range of {val_lb} - {val_ub}."
-            )
     
     test_lb = test_acc_lb - test_acc_lb_var
     test_ub = test_acc_lb + test_acc_lb_var
